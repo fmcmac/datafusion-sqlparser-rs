@@ -92,6 +92,7 @@ pub trait Spanned {
 }
 
 impl Spanned for Query {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         let Query {
             with,
@@ -196,6 +197,7 @@ impl Spanned for Cte {
 ///
 /// [SetExpr::Table] is not implemented.
 impl Spanned for SetExpr {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         match self {
             SetExpr::Select(select) => select.span(),
@@ -292,6 +294,7 @@ impl Spanned for Values {
 /// - [Statement::Unload]
 /// - [Statement::OptimizeTable]
 impl Spanned for Statement {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         match self {
             Statement::Analyze {
@@ -1424,6 +1427,7 @@ impl Spanned for AssignmentTarget {
 /// - [Expr::Map] # DuckDB specific
 /// - [Expr::Lambda]
 impl Spanned for Expr {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         match self {
             Expr::Identifier(ident) => ident.span,
@@ -1793,6 +1797,7 @@ impl Spanned for SelectItemQualifiedWildcardKind {
 }
 
 impl Spanned for SelectItem {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         match self {
             SelectItem::UnnamedExpr(expr) => expr.span(),
@@ -1894,6 +1899,7 @@ impl Spanned for ReplaceSelectElement {
 /// Missing spans:
 /// - [TableFactor::JsonTable]
 impl Spanned for TableFactor {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         match self {
             TableFactor::Table {
@@ -2214,6 +2220,7 @@ impl Spanned for TableWithJoins {
 }
 
 impl Spanned for Select {
+    #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn span(&self) -> Span {
         let Select {
             select_token,
@@ -2507,5 +2514,39 @@ pub mod tests {
             test.get_source(expr_span),
             "CASE 1 WHEN 2 THEN 3 ELSE 4 END"
         );
+    }
+
+    // Regression: the `Spanned::span` walk used to be unbounded recursion, so a
+    // deeply nested expression (the shape a broad row-level-security predicate or
+    // machine-generated SQL can produce) overflowed the stack and aborted the
+    // process with SIGSEGV. With the `recursive-protection` feature the walk
+    // grows the stack on demand and completes.
+    //
+    // The AST is built directly (the parser is not the subject here) and walked
+    // on a deliberately small (512 KiB) thread stack, so the chosen depth
+    // reliably overflows *without* the fix — a stack overflow aborts the whole
+    // process, failing the test — while the O(n) walk stays fast with it.
+    #[test]
+    fn test_deeply_nested_expr_span_does_not_overflow() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                // Far exceeds what a 512 KiB stack holds unprotected, so the
+                // walk overflows without the fix regardless of frame size; with
+                // the fix `stacker` grows the stack and the walk completes.
+                let depth = 200_000;
+                let mut expr = Expr::Identifier(crate::ast::Ident::new("x"));
+                for _ in 0..depth {
+                    expr = Expr::Nested(Box::new(expr));
+                }
+                // Must not overflow the stack while walking the deep AST.
+                let _ = expr.span();
+                // The nested `Box<Expr>` chain has a recursive `Drop`; forget it
+                // to keep the test fast and isolate the span walk under test.
+                core::mem::forget(expr);
+            })
+            .unwrap()
+            .join()
+            .expect("span walk overflowed the small-stack thread");
     }
 }
